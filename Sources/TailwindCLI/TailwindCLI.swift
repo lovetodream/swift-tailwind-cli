@@ -56,11 +56,13 @@ public struct TailwindCLI: Sendable {
         }
 
         // copy themes and js to out dir
-        let outputPath = FilePath(output).removingLastComponent()
         try await withThrowingDiscardingTaskGroup { group in
+            let outputPath = FilePath(output).removingLastComponent().appending("flowbite")
+            let themesPath = outputPath.appending("themes")
+            try await FileSystem.shared.createDirectory(at: themesPath, withIntermediateDirectories: true)
             for theme in assets.themes {
                 group.addTask {
-                    try await FileSystem.shared.copyItem(at: theme.path, to: outputPath.appending(theme.name))
+                    try await FileSystem.shared.copyItem(at: theme.path, to: themesPath.appending(theme.name))
                 }
             }
             for js in assets.js {
