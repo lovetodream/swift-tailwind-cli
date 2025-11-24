@@ -24,35 +24,102 @@ struct Downloader {
     let fileSystem: FileSystem
     let strictMode: Bool
 
-    func download(version: TailwindVersion = .latest, to directory: FilePath? = nil) async throws -> FilePath {
+    struct DownloadResult {
+        let executable: FilePath
+        let themes: [(name: String, path: FilePath)]
+        let js: [(name: String, path: FilePath)]
+    }
+    func download(version: TailwindVersion = .latest, to directory: FilePath? = nil) async throws -> DownloadResult {
         guard let binaryName = try await self.binaryName() else {
             throw Error.unableToDetermineBinaryName
         }
 
         // fast path, no api calls needed
         let expectedVersion = self.expectedVersion(for: version)
-        let binaryPath: FilePath
+        let downloadDirectory: FilePath
         if let directory {
-            binaryPath = directory.appending(expectedVersion).appending(binaryName)
+            downloadDirectory = directory.appending(expectedVersion)
         } else {
-            binaryPath = try await self.fileSystem.temporaryDirectory.appending("swift-tailwind").appending(
-                expectedVersion
-            ).appending(binaryName)
+            downloadDirectory = try await self.fileSystem.temporaryDirectory
+                .appending("swift-tailwind")
+                .appending(expectedVersion)
         }
+        let binaryPath = downloadDirectory.appending(binaryName)
 
         if try await self.fileSystem.info(forFileAt: binaryPath) != nil {
-            return binaryPath
+            return try await self.fileSystem.withDirectoryHandle(atPath: downloadDirectory) { directory in
+                var themes: [(name: String, path: FilePath)] = []
+                var js: [(name: String, path: FilePath)] = []
+                for try await content in directory.listContents() {
+                    if content.name.string.hasSuffix(".css") {
+                        themes.append((content.name.string, content.path))
+                    } else if content.name.string.contains(/\.js(\.|$)/) {
+                        js.append((content.name.string, content.path))
+                    }
+                }
+                return .init(executable: binaryPath, themes: themes, js: js)
+            }
         }
 
         // api calls
-        let (version, remoteChecksum, downloadURL) = try await self.downloadMetadata(binary: binaryName, for: version)
+        let (version, binary, themes, js) = try await self.downloadMetadata(binary: binaryName, for: version)
         self.logger.debug("Downloading tailwindcss version \(version)")
-        try await self.downloadBinary(from: downloadURL, to: binaryPath)
 
-        // checksum validation
+        var availableThemes: [(name: String, path: FilePath)] = []
+        var availableJS: [(name: String, path: FilePath)] = []
+        enum FileType {
+            case executable
+            case theme(String, FilePath)
+            case js(String, FilePath)
+        }
+        try await withThrowingTaskGroup(of: FileType.self) { group in
+
+            // executable
+            group.addTask {
+                try await self.downloadBinary(from: binary.downloadURL, to: binaryPath)
+                try await self.validateBinary(binaryPath: binaryPath, remoteChecksum: binary.digest)
+                return .executable
+            }
+
+            // flowbite themes
+            for theme in themes {
+                group.addTask {
+                    let path = downloadDirectory.appending(theme.name)
+                    try await self.downloadBinary(from: theme.downloadURL, to: path)
+                    try await self.validateBinary(binaryPath: path, remoteChecksum: theme.digest)
+                    return .theme(theme.name, path)
+                }
+            }
+
+            // flowbite js support
+            for js in js {
+                group.addTask {
+                    let path = downloadDirectory.appending(js.name)
+                    try await self.downloadBinary(from: js.downloadURL, to: path)
+                    try await self.validateBinary(binaryPath: path, remoteChecksum: js.digest)
+                    return .js(js.name, path)
+                }
+            }
+
+            for try await asset in group {
+                switch asset {
+                case .executable:
+                    continue
+                case .theme(let name, let path):
+                    availableThemes.append((name, path))
+                case .js(let name, let path):
+                    availableJS.append((name, path))
+                }
+            }
+        }
+
+        return .init(executable: binaryPath, themes: availableThemes, js: availableJS)
+    }
+
+    func validateBinary(binaryPath: FilePath, remoteChecksum: String) async throws {
         guard self.strictMode else {
             self.logger.debug("Skipping checksum validation as strict mode is disabled.")
-            return binaryPath
+            return
         }
 
         let checksumResult = try await run(
@@ -68,8 +135,6 @@ struct Downloader {
         guard localChecksum == remoteChecksum.dropFirst("sha256:".count) else {
             throw Error.checksumMismatch(local: String(localChecksum), remote: remoteChecksum)
         }
-
-        return binaryPath
     }
 
     func downloadBinary(from url: String, to downloadPath: FilePath) async throws {
@@ -91,28 +156,45 @@ struct Downloader {
                 offset += try await write.write(contentsOf: chunk, toAbsoluteOffset: offset)
             }
         }
-        //        let result = try await run(.name("chmod"), arguments: ["+x", downloadPath.string], output: .discarded)
-        //        guard result.terminationStatus.isSuccess else {
-        //            throw Error.unableToFlagBinaryAsExecutable
-        //        }
     }
 
     func downloadMetadata(binary: String, for version: TailwindVersion) async throws -> (
         version: String,
-        checksum: String,
-        download: String
+        download: Asset,
+        themes: [Asset],
+        js: [Asset]
     ) {
         let apiURL: String
-        let fallbackDownloadURL: String
+        let fallbackDownloadURL: Asset
+        let fallbackThemes: [Asset]
+        let fallbackJS: [Asset]
         switch version {
         case .latest:
-            apiURL = "https://api.github.com/repos/dobicinaitis/tailwind-cli-extra/releases/latest"
-            fallbackDownloadURL =
-                "https://github.com/dobicinaitis/tailwind-cli-extra/releases/latest/download/\(binary)"
+            apiURL = "https://api.github.com/repos/lovetodream/tailwind-flowbite-bundled-cli/releases/latest"
+            fallbackDownloadURL = .init(
+                name: binary,
+                downloadURL: "https://github.com/lovetodream/tailwind-flowbite-bundled-cli/releases/latest/download/\(binary)"
+            )
+            fallbackThemes = [
+                .init(name: "themes.css", downloadURL: "https://github.com/lovetodream/tailwind-flowbite-bundled-cli/releases/latest/download/themes.css"),
+                .init(name: "default.css", downloadURL: "https://github.com/lovetodream/tailwind-flowbite-bundled-cli/releases/latest/download/default.css")
+            ]
+            fallbackJS = [
+                .init(name: "flowbite.min.js", downloadURL: "https://github.com/lovetodream/tailwind-flowbite-bundled-cli/releases/latest/download/flowbite.min.js")
+            ]
         case .fixed(let version):
-            apiURL = "https://api.github.com/repos/dobicinaitis/tailwind-cli-extra/releases/v\(version)"
-            fallbackDownloadURL =
-                "https://github.com/dobicinaitis/tailwind-cli-extra/releases/download/v\(version)/\(binary)"
+            apiURL = "https://api.github.com/repos/lovetodream/tailwind-flowbite-bundled-cli/releases/v\(version)"
+            fallbackDownloadURL = .init(
+                name: binary,
+                downloadURL: "https://github.com/lovetodream/tailwind-flowbite-bundled-cli/releases/download/v\(version)/\(binary)"
+            )
+            fallbackThemes = [
+                .init(name: "themes.css", downloadURL: "https://github.com/lovetodream/tailwind-flowbite-bundled-cli/releases/download/v\(version)/themes.css"),
+                .init(name: "default.css", downloadURL: "https://github.com/lovetodream/tailwind-flowbite-bundled-cli/releases/download/v\(version)/default.css")
+            ]
+            fallbackJS = [
+                .init(name: "flowbite.min.js", downloadURL: "https://github.com/lovetodream/tailwind-flowbite-bundled-cli/releases/download/v\(version)/flowbite.min.js")
+            ]
         }
         self.logger.trace("Downloading metadata from \(apiURL)")
 
@@ -123,35 +205,54 @@ struct Downloader {
         var body = try await response.body.collect(upTo: 1024 * 1024)
         let json = body.readString(length: body.readableBytes).unsafelyUnwrapped
 
-        let tagNameRegex = /"tag_name"\s*:\s*"([^"]+)"/
-        guard let tag = json.firstMatch(of: tagNameRegex)?.output.1 else {
+        let tagNameRegex = /"tag_name"\s*:\s*"(?<version>[^"]+)"/
+        guard let tag = json.firstMatch(of: tagNameRegex)?.output.version else {
             self.logger.debug("Unexpected metadata response, tag_name not found, continuing with 'latest'")
-            return ("latest", "", fallbackDownloadURL)
+            return ("latest", fallbackDownloadURL, fallbackThemes, fallbackJS)
         }
 
-        let nameRegex = try Regex(#""name"\s*:\s*"\#(binary)""#)
-        guard let nameMatch = json.firstMatch(of: nameRegex) else {
-            self.logger.debug("Unexpected metadata response, digest not found, continuing without check")
-            return (String(tag), "", fallbackDownloadURL)
+        let namesRegex = /"name"\s*:\s*"(?<filename>[^"]+)"/
+        let nameMatches = json.matches(of: namesRegex)
+
+        var download: Asset?
+        var themes: [Asset] = []
+        var js: [Asset] = []
+
+        for nameMatch in nameMatches {
+            let name = nameMatch.output.filename
+
+            var endIndex = nameMatch.range.lowerBound
+            _ = json.formIndex(&endIndex, offsetBy: 2_000, limitedBy: json.index(before: json.endIndex))
+            let part = json[nameMatch.range.lowerBound...endIndex]
+            
+            let digestRegex = /"digest"\s*:\s*"(?<hash>[^"]+)"/
+            let digest = part.firstMatch(of: digestRegex)?.output.1
+            
+            let downloadURLRegex = /"browser_download_url"\s*:\s*"(?<url>[^"]+)"/
+            let downloadURL = part.firstMatch(of: downloadURLRegex)?.output.1
+
+            guard let downloadURL else { continue }
+            let asset = Asset(
+                name: String(name),
+                digest: digest.flatMap({ String($0) }),
+                downloadURL: String(downloadURL)
+            )
+
+            if name == binary {
+                download = asset
+            } else if name.hasSuffix(".css") {
+                themes.append(asset)
+            } else if name.contains(/\.js(\.|$)/) {
+                js.append(asset)
+            }
         }
 
-        var endIndex = nameMatch.range.lowerBound
-        _ = json.formIndex(&endIndex, offsetBy: 2_000, limitedBy: json.index(before: json.endIndex))
-        let part = json[nameMatch.range.lowerBound...endIndex]
-
-        let digestRegex = /"digest"\s*:\s*"([^"]+)"/
-        guard let digest = part.firstMatch(of: digestRegex)?.output.1 else {
-            self.logger.debug("Unexpected metadata response, digest not found, continuing without check")
-            return (String(tag), "", fallbackDownloadURL)
-        }
-
-        let downloadURLRegex = /"browser_download_url"\s*:\s*"([^"]+)"/
-        guard let downloadURL = part.firstMatch(of: downloadURLRegex)?.output.1 else {
+        guard let download else {
             self.logger.debug("Unexpected metadata response, browser_download_url not found, continuing with fallback")
-            return (String(tag), String(digest), fallbackDownloadURL)
+            return ("latest", fallbackDownloadURL, fallbackThemes, fallbackJS)
         }
 
-        return (String(tag), String(digest), String(downloadURL))
+        return (String(tag), download, themes, js)
     }
 
     private func expectedVersion(for version: TailwindVersion) -> String {
@@ -183,7 +284,7 @@ struct Downloader {
             ext = ""
         #endif
 
-        return "tailwindcss-extra-\(os)-\(architecture.tailwindValue)\(ext)"
+        return "tailwindcss-flowbite-\(os)-\(architecture.tailwindValue)\(ext)"
     }
 
     enum Error: Swift.Error {
@@ -191,5 +292,17 @@ struct Downloader {
         case unableToFlagBinaryAsExecutable
         case checksumMismatch(local: String, remote: String)
         case downloadError
+    }
+
+    struct Asset {
+        let name: String
+        let digest: String
+        let downloadURL: String
+
+        init(name: String, digest: String? = nil, downloadURL: String) {
+            self.name = name
+            self.digest = digest ?? ""
+            self.downloadURL = downloadURL
+        }
     }
 }

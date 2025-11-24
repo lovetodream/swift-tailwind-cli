@@ -26,8 +26,8 @@ import _NIOFileSystem
         fileSystem: .shared,
         strictMode: true
     )
-    let tmpDir = try await fs.temporaryDirectory.appending(RandomID.generate().description)
-    let file = try await downloader.download(version: .latest, to: tmpDir)
-    #expect(file.isEmpty == false)
-    try await fs.removeItem(at: tmpDir, recursively: true)
+    try await fs.withTemporaryDirectory { directory, path in
+        let assets = try await downloader.download(version: .latest, to: path)
+        #expect(assets.executable.isEmpty == false)
+    }
 }
