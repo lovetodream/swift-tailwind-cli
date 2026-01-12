@@ -47,13 +47,6 @@ public struct TailwindCLI: Sendable {
     ) async throws {
         let assets = try await self.downloader.download(
             version: self.version, to: directory.flatMap({ .init($0) }))
-        let arguments = Arguments(["--input", input, "--output", output] + options.map(\.flag))
-        let result = try await Subprocess.run(
-            .path(.init(assets.executable.string)), arguments: arguments, output: .discarded,
-            error: .string(limit: 1024, encoding: UTF8.self))
-        guard result.terminationStatus.isSuccess else {
-            throw Error.cliFailure(result.standardError)
-        }
 
         // copy themes and js to out dir
         try await withThrowingDiscardingTaskGroup { group in
@@ -71,6 +64,15 @@ public struct TailwindCLI: Sendable {
                     try await FileSystem.shared.copyItem(at: js.path, to: outputPath.appending(js.name))
                 }
             }
+        }
+
+        // run cli
+        let arguments = Arguments(["--input", input, "--output", output] + options.map(\.flag))
+        let result = try await Subprocess.run(
+            .path(.init(assets.executable.string)), arguments: arguments, output: .discarded,
+            error: .string(limit: 1024, encoding: UTF8.self))
+        guard result.terminationStatus.isSuccess else {
+            throw Error.cliFailure(result.standardError)
         }
     }
 
