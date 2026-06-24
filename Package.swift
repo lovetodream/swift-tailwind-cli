@@ -14,7 +14,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.1"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.88.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", from: "1.23.1"),
-        .package(url: "https://github.com/swiftlang/swift-subprocess.git", from: "0.2.1", traits: ["SubprocessSpan"]),
+        .package(url: "https://github.com/swiftlang/swift-subprocess.git", from: "0.5.0"),
     ],
     targets: [
         .target(
